@@ -1,19 +1,92 @@
 <script>
 'use strict';
 
+var SAVING_CHANGES_BACK = false;
+
+var all = function(seq) {
+    for (var i = 0; i < seq.length; ++i)
+        if (!seq[i])
+            return false;
+
+    return true;
+}
+
+var applyingChangeNow = {};
+
+var SOCKET_HOST = 'http://localhost:9105';
+
 var diffMatchPatch;
+var onload_cbs = [];
+
 /**
  * @param {Function} onload
  */
 function loadDiffMatchPatch(onload) {
+    if (diffMatchPatch)
+        return onload();
+
+    onload_cbs.push(onload);
+
+    if (document.getElementById('diffmatchpath'))
+        return;
+
     var script = document.createElement('script');
+    script.setAttribute('id', 'diffmatchpatch');
     script.src = 'diff_match_patch.js';
     script.onload = function() {
         diffMatchPatch = new diff_match_patch();
-        onload();
+        onload_cbs.forEach(function(cb) { cb(); });
+        onload_cbs = [];
     };
     document.head.appendChild(script);
 }
+
+function loadSocketIO() {
+    loadDiffMatchPatch(function() {
+        var script = document.createElement('script');
+        script.src = 'socket.io.js';
+        script.onload = function() {
+            console.log('loaded socketIO');
+            var socket = io.connect(SOCKET_HOST);
+              socket.on('fileChanged', function (data) {
+                console.log('change url', data.url);
+                var done = false;
+                chrome.experimental.devtools.inspectedWindow.getResources(function(resources) {
+                    resources.forEach(function(resource) {
+                        if (done) return;
+
+                        if (resource.url === data.url) {
+                            done = true;
+                            console.log('found url:', data.url);
+                            resource.getContent(function(oldContents) {
+                                var patchResult = diffMatchPatch.patch_apply(data.patch, oldContents);
+                                var hunkResults = patchResult[1];
+                                if (!hunkResults.length)
+                                    return console.log('no hunk results');
+                                if (!all(hunkResults))
+                                    return console.log('patch failed!');
+                                var newContents = patchResult[0];
+                                applyingChangeNow[data.url] = true;
+                                resource.setContent(newContents, true, function (res) {
+                                    applyingChangeNow[data.url] = false;
+                                    if (res.code !== 'OK')
+                                        console.error('error setting ' + data.url + ': ' + JSON.stringify(res));
+                                    else
+                                        console.log('saved resource ' + data.url);
+                                });
+                            });
+                        }
+                    });
+                    if (!done)
+                        console.log('did not find url', data.url);
+                });
+              });
+        };
+        document.head.appendChild(script);
+    });
+}
+
+loadSocketIO();
 
 /**
  * @return {Object}
@@ -45,6 +118,9 @@ var lastStylesheetURL = '';
 var addedCSS = '';
 
 chrome.experimental.devtools.inspectedWindow.onResourceContentCommitted.addListener(function(event) {
+    if (!SAVING_CHANGES_BACK)
+        return;
+
     if (event.type === 'document') {
         if (lastStylesheetURL) {
             getBackend(lastStylesheetURL);
@@ -56,6 +132,9 @@ chrome.experimental.devtools.inspectedWindow.onResourceContentCommitted.addListe
     }
 
     function getBackend(url) {
+        if (applyingChangeNow[url])
+            return;
+
         chrome.extension.sendRequest({method: 'getBackend', url: url, type: event.type}, function(backendURL) {
 
             if (!backendURL) {
@@ -152,4 +231,5 @@ chrome.experimental.devtools.onReset.addListener(function() {
     addedCSS = '';
     getAllResources();
 });
+
 </script>
